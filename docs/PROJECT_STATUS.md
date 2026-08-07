@@ -2,20 +2,18 @@
 
 Detailed overview of what the project is, how much is done, what comes next, and how the system fits together.
 
+**Architecture decisions (weak spots fixed):** → [ARCHITECTURE.md](ARCHITECTURE.md)  
+**Shared contracts:** → [`schemas/`](../schemas/)  
+**Golden notes:** → [`docs/golden/`](golden/)  
+**RAG corpus prep:** → [`docs/rag/CORPUS.md`](rag/CORPUS.md)
+
 ---
 
 ## 1. Project overview
 
 **KubeAssist AI** is a student-scope web application that helps developers troubleshoot Kubernetes issues using AI.
 
-Users select a pod (or ask a question). The Go backend gathers live cluster evidence (status, events, logs, YAML). The Python AI service retrieves related Kubernetes documentation with RAG (FAISS) and uses an LLM to return:
-
-- Observed failure / status  
-- Supporting evidence  
-- Likely cause  
-- Ordered fix steps  
-- Verification commands  
-- Documentation citations  
+Users select a pod (or ask a question). The Go backend gathers live cluster evidence (status, events, logs, YAML) and runs **deterministic detectors**. The Python AI service retrieves related Kubernetes documentation with RAG (FAISS) and uses an LLM to return a structured diagnosis. The LLM **explains**; it does **not** classify failure type.
 
 The goal is **not** full SRE automation. The app recommends fixes; it does **not** auto-apply changes to the cluster.
 
@@ -25,7 +23,7 @@ Pods, Deployments, Services, Events, Logs, YAML config checker, documentation Q&
 
 ### Out of scope (MVP)
 
-Multi-cluster, autonomous remediation, Prometheus/Loki, message queues, multi-tenant SaaS.
+Multi-cluster, autonomous remediation, Prometheus/Loki, message queues, Redis, Kafka, Kubernetes operators, multi-tenant SaaS, Ingress/NetworkPolicy collection (unless a golden case requires it).
 
 ---
 
@@ -35,46 +33,44 @@ Multi-cluster, autonomous remediation, Prometheus/Loki, message queues, multi-te
 | --- | --- |
 | Frontend | React, TypeScript, Tailwind CSS |
 | Backend API | Go + client-go |
-| AI service | Python, RAG, LLM |
-| Vector store | FAISS |
-| Database | PostgreSQL |
+| Detectors | Go (deterministic; no LLM) |
+| AI service | Python FastAPI, OpenAI-compatible LLM |
+| RAG | FAISS + curated kubernetes.io docs |
+| LangChain | Optional loaders/splitters only — no agents |
+| Database | PostgreSQL (investigation history only) |
+| Cache | Go in-process TTL (pod list) — no Redis |
 | Local cluster lab | Kind, kubectl, Docker |
 
 ---
 
 ## 3. Architecture
 
-### Mermaid
+See [ARCHITECTURE.md](ARCHITECTURE.md) for trust boundaries, two-pass collector, caps, and streaming rules.
 
 ```mermaid
 flowchart TB
   userNode[User]
-
   subgraph frontend [Frontend]
     reactApp["React Dashboard and AI Panel"]
   end
-
   subgraph backend [Go Backend]
-    goApi["REST API"]
-    collector["K8s Context Collector"]
+    goApi["REST and SSE"]
+    collector["Two-pass Collector"]
+    detectors["Detectors"]
+    redactor["Secret Redactor"]
     orchestrator["AI Orchestrator"]
     storeClient["Postgres Client"]
   end
-
   subgraph cluster [Local Kind Cluster]
     k8sApi["Kubernetes API Server"]
     labWorkloads["kubeassist-lab workloads"]
   end
-
   subgraph ai [Python AI Service]
     troubleshootNode[Troubleshoot]
-    summarizeNode["Log Summarizer"]
-    docsNode["Doc Search"]
-    configCheck["YAML Config Checker"]
     retriever["FAISS Retriever"]
     llmClient["LLM Client"]
+    validator["Response Validator"]
   end
-
   subgraph data [Data Stores]
     postgresDb[("PostgreSQL")]
     faissIndex[("FAISS Index")]
@@ -85,51 +81,28 @@ flowchart TB
   goApi --> collector
   collector --> k8sApi
   k8sApi --> labWorkloads
-  goApi --> orchestrator
+  collector --> redactor
+  redactor --> detectors
+  detectors --> orchestrator
   orchestrator --> troubleshootNode
-  orchestrator --> summarizeNode
-  orchestrator --> docsNode
-  orchestrator --> configCheck
   troubleshootNode --> retriever
-  docsNode --> retriever
   retriever --> faissIndex
   troubleshootNode --> llmClient
-  summarizeNode --> llmClient
-  docsNode --> llmClient
-  configCheck --> llmClient
+  llmClient --> validator
+  validator --> orchestrator
   goApi --> storeClient
   storeClient --> postgresDb
 ```
 
-### ASCII fallback
+**Design rules:**
 
-```
-User
-  |
-  v
-React Frontend  (dashboard, pod details, AI panel)
-  |
-  v
-Go Backend API
-  |-- reads cluster --> Kubernetes API --> Kind lab pods
-  |-- stores history --> PostgreSQL
-  |
-  v
-Python AI Service
-  |-- retrieves docs --> FAISS
-  |-- reasons --> LLM
-  |
-  v
-Structured answer back to the UI
-```
-
-**Design rule:** Only the Go backend talks to the Kubernetes API. The Python AI service receives a diagnostic snapshot and does not hold kubeconfig credentials.
+- Only Go talks to the Kubernetes API.
+- Python receives a redacted `DiagnosticSnapshot` (see schemas).
+- Detectors set `failureType` + `searchTerms` in Go; AI must not reclassify.
 
 ---
 
 ## 4. End-to-end troubleshooting flow
-
-### Mermaid
 
 ```mermaid
 sequenceDiagram
@@ -142,231 +115,160 @@ sequenceDiagram
   participant L as LLM
   participant DB as Postgres
 
-  U->>FE: "Select pod and ask why it is failing"
-  FE->>GO: "POST /api/pods/{ns}/{pod}/troubleshoot"
-  GO->>K8s: "Get pod status events logs yaml owner"
-  K8s-->>GO: "Diagnostic snapshot"
-  GO->>AI: "POST /ai/troubleshoot with snapshot"
-  AI->>AI: "Detect failure type from evidence"
-  AI->>V: "Retrieve relevant K8s docs"
-  V-->>AI: "Doc chunks plus citations"
-  AI->>L: "Prompt with evidence plus docs"
-  L-->>AI: "Structured diagnosis JSON"
-  AI-->>GO: "Cause evidence fixSteps citations"
-  GO->>DB: "Save investigation"
-  GO-->>FE: "Diagnosis response"
-  FE-->>U: "Show cause steps verification sources"
+  U->>FE: Select pod and ask why it is failing
+  FE->>GO: POST troubleshoot or SSE stream
+  GO->>K8s: CollectCore pod events logs owners
+  K8s-->>GO: Core evidence
+  GO->>GO: Detect failureType searchTerms
+  GO->>K8s: CollectRelated if needed
+  GO->>GO: Redact secrets
+  GO->>AI: POST /ai/troubleshoot snapshot
+  AI->>V: Retrieve using detector searchTerms
+  V-->>AI: Doc chunks plus citations
+  AI->>L: Prompt with evidence plus docs
+  L-->>AI: Structured diagnosis JSON
+  AI->>AI: Validate schema and grounding
+  AI-->>GO: DiagnosisResponse
+  GO->>DB: Save investigation
+  GO-->>FE: Diagnosis plus optional SSE stages
 ```
 
-### Numbered steps (always readable)
+### Numbered steps
 
-1. User selects a pod in React and asks why it is failing.  
-2. React calls Go: `POST /api/pods/{ns}/{pod}/troubleshoot`.  
-3. Go collects from Kubernetes: pod status/restarts, events, current + previous logs, YAML / owner Deployment.  
-4. Go sends that snapshot to the Python AI service.  
-5. Python detects failure type, retrieves matching docs from FAISS, and asks the LLM for a structured diagnosis.  
-6. Go saves the investigation in PostgreSQL.  
-7. UI shows status, evidence, likely cause, fix steps, verification commands, and citations.
+1. User selects a pod in React (optional `serviceName` for Service issues).  
+2. React calls Go troubleshoot (JSON or SSE stages: collecting → detecting → retrieving → diagnosing → done).  
+3. Go **pass 1** collects core evidence; **detectors** classify; **pass 2** expands related resources if needed.  
+4. Go redacts and sends `DiagnosticSnapshot` to Python.  
+5. Python retrieves docs with `searchTerms`, prompts LLM, validates JSON (no invented evidence).  
+6. Go saves investigation in PostgreSQL.  
+7. UI shows full diagnosis fields including citations and uncertainty notes.
 
 ---
 
 ## 5. Progress so far
 
-**Overall MVP completion: ~10–15%** (planning + lab fixtures). Application services: **not started**.
+**Overall MVP completion: ~20%** (planning + lab fixtures + contracts + golden notes + RBAC). Application services: **not started**.
 
 | Area | Status | Notes |
 | --- | --- | --- |
 | Project idea / scope | Done | Student MVP locked |
-| System design | Done | Architecture and phases defined |
-| Phase 1 lab manifests | Done | All 8 YAML files under `k8s/lab/` |
-| Phase 1 cluster verification | Partial | Apply and inspect every scenario on Kind |
-| Phase 2 Go collector | Not started | No Go code yet |
-| Phase 3 failure detectors | Not started | — |
-| Phase 4 FAISS docs index | Not started | — |
-| Phase 5 Python AI service | Not started | — |
-| Phase 6 prompts / JSON schema | Not started | — |
-| Phase 7 Go + AI + Postgres | Not started | — |
-| Phase 8 React UI | Not started | — |
-| Phase 9 evaluation / polish | Not started | — |
+| System design / weak spots | Done | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Shared JSON schemas | Done | [`schemas/`](../schemas/) |
+| Phase 1 lab manifests | Done | 8 YAMLs; `missing-config-app` Deployment fixed |
+| Phase 1 golden notes | Done | [`docs/golden/`](golden/) expected signals |
+| Phase 1 Kind verify | Partial | Apply lab and confirm against goldens |
+| RBAC read-only | Done | [`k8s/rbac/`](../k8s/rbac/) |
+| RAG corpus list + license note | Done | [`docs/rag/`](rag/) — ingest not started |
+| Env template | Done | [`.env.example`](../.env.example) |
+| Phase 2 Go collector | Not started | — |
+| Phase 3 detectors | Not started | — |
+| Phase 4 FAISS ingest | Not started | Ready to start after Kind verify |
+| Phase 5 AI + RAG pipeline | Not started | Can use schemas + golden fixtures |
+| Phase 6 React | Not started | — |
+| Phase 7 Integration | Not started | — |
+| Phase 8 Eval / polish | Not started | — |
 
 ### Repo today
 
 ```
 Kubernetes-assistant/
-├── k8s/lab/
-│   ├── healthy-app.yaml
-│   ├── crashloop-app.yaml
-│   ├── probe-failure-app.yaml
-│   ├── image-pull-failure.yaml
-│   ├── oom-failure.yaml
-│   ├── missing-config-app.yaml
-│   ├── scheduling-failure.yaml
-│   └── service-selector-failure.yaml
+├── .env.example
+├── k8s/
+│   ├── lab/                 # 8 failure manifests
+│   └── rbac/                # read-only collector RBAC
+├── schemas/                 # snapshot + diagnosis contracts
 ├── docs/
-│   └── PROJECT_STATUS.md
+│   ├── PROJECT_STATUS.md
+│   ├── ARCHITECTURE.md
+│   ├── golden/              # expected signals per scenario
+│   └── rag/                 # corpus list + docs license note
 └── README.md
 ```
-
-### Phase completion snapshot
-
-| Phase | Progress |
-| --- | --- |
-| 1 Lab + manifests | ~80% (files done; finish verification) |
-| 2–9 Application work | 0% |
 
 ---
 
 ## 6. Lab failure reference
 
-Intentional broken workloads for learning and later AI evaluation.
-
-| Scenario | File | Failure type | Meaning | Typical fix |
+| Scenario | File | failureType | Meaning | Typical fix |
 | --- | --- | --- | --- | --- |
-| Healthy baseline | `healthy-app.yaml` | None | Control sample | — |
+| Healthy baseline | `healthy-app.yaml` | Healthy | Control sample | — |
 | App crash loop | `crashloop-app.yaml` | CrashLoopBackOff | Process exits with error | Fix app/config so process does not exit |
-| Probe too early | `probe-failure-app.yaml` | Probe → CrashLoop | Liveness kills slow-starting app | Add `startupProbe` or increase delay |
+| Probe too early | `probe-failure-app.yaml` | ProbeFailure | Liveness kills slow-starting app | Add `startupProbe` or increase delay |
 | Bad image | `image-pull-failure.yaml` | ImagePullBackOff | Image cannot be pulled | Fix image name / registry / auth |
 | Memory kill | `oom-failure.yaml` | OOMKilled | Exceeded memory limit | Raise limit or reduce usage |
-| Missing config | `missing-config-app.yaml` | CreateContainerConfigError | ConfigMap missing | Create ConfigMap/Secret with correct keys |
+| Missing config key | `missing-config-app.yaml` | CreateContainerConfigError | ConfigMap key missing | Add key or fix env ref |
 | Cannot schedule | `scheduling-failure.yaml` | FailedScheduling | Requests too large | Lower resource requests |
-| Bad Service | `service-selector-failure.yaml` | Selector mismatch | Pod OK, no endpoints | Align Service selector with pod labels |
+| Bad Service | `service-selector-failure.yaml` | ServiceSelectorMismatch | Pod OK, no endpoints | Align Service selector with pod labels |
 
 ---
 
-## 7. Phase roadmap
-
-### Mermaid
-
-```mermaid
-flowchart LR
-  P1["Phase 1 Lab"]
-  P2["Phase 2 Go Collector"]
-  P3["Phase 3 Detectors"]
-  P4["Phase 4 RAG Index"]
-  P5["Phase 5 AI Service"]
-  P6["Phase 6 Prompts"]
-  P7["Phase 7 Integration"]
-  P8["Phase 8 Frontend"]
-  P9["Phase 9 Eval Polish"]
-
-  P1 --> P2
-  P2 --> P3
-  P3 --> P4
-  P4 --> P5
-  P5 --> P6
-  P6 --> P7
-  P7 --> P8
-  P8 --> P9
-```
-
-### ASCII fallback
+## 7. Phase roadmap (corrected order)
 
 ```
-Phase 1 Lab
-  -> Phase 2 Go Collector
-  -> Phase 3 Detectors
-  -> Phase 4 RAG Index
-  -> Phase 5 AI Service
-  -> Phase 6 Prompts
-  -> Phase 7 Integration
-  -> Phase 8 Frontend
-  -> Phase 9 Eval + Polish
+Phase 1 Lab + goldens
+  -> Phase 2 Go Collector (two-pass + redact)
+  -> Phase 3 Detectors (Go; no LLM)
+  -> Phase 4 Docs ingest + FAISS
+  -> Phase 5 Python AI + RAG troubleshoot
+  -> Phase 6 React frontend
+  -> Phase 7 Integration (Postgres + SSE)
+  -> Phase 8 Eval + polish
 ```
 
-### Summary table
+| Phase | Focus | Exit criteria |
+| --- | --- | --- |
+| 1 | Failure lab + golden notes | Manifests + goldens done; Kind verify recommended |
+| 2 | Go collector | Snapshot JSON + redaction + pod APIs |
+| 3 | Detectors | Snapshot → failureType without LLM; golden unit tests |
+| 4 | FAISS index | Retrieval smoke tests per failureType |
+| 5 | AI service | Validated DiagnosisResponse from fixtures/live snapshots |
+| 6 | React UI | Dashboard, evidence, diagnosis page |
+| 7 | Integration | E2E troubleshoot + history + SSE stages |
+| 8 | Eval / polish | Detector accuracy, demo README |
 
-| Phase | Focus | Est. time | Exit criteria |
-| --- | --- | --- | --- |
-| 1 | Failure lab on Kind | Finishing | Every scenario applied, inspected, golden notes written |
-| 2 | Go + client-go collector | 1–1.5 weeks | Snapshot JSON for a pod (status, events, logs, YAML, owner) |
-| 3 | Deterministic detectors | 2–4 days | Snapshot → failureType + evidence + searchTerms without LLM |
-| 4 | Docs → FAISS | 3–5 days | Probe/CrashLoop queries retrieve relevant K8s docs |
-| 5 | Python AI service | ~1 week | `/ai/troubleshoot` returns structured diagnosis |
-| 6 | Prompt + JSON schema | 2–3 days | Validated cause, steps, citations, uncertainty |
-| 7 | Go orchestrates AI + Postgres | 3–5 days | Public troubleshoot API + saved history |
-| 8 | React UI | 1–1.5 weeks | Dashboard, pod details, AI panel, config checker |
-| 9 | Tests + polish | ~1 week | Golden cases demoable; run instructions complete |
+**Parallel track:** After Phase 1 contracts, AI/RAG (4–5) may proceed on fixtures while Go (2–3) is built by another owner — **do not change schemas unilaterally.**
 
 **Total:** about 6–8 weeks of part-time work.
-
-### Phase details (what remains)
-
-#### Phase 1 — Finish verification
-
-- Apply all manifests in `k8s/lab/`
-- For each pod: get, describe, events, logs / `--previous`
-- Document expected evidence, cause, fix, and verification
-- Manually fix one scenario and confirm recovery
-
-#### Phase 2 — Go Kubernetes collector
-
-- Connect via kubeconfig (`kind-kubeassist-dev`)
-- List pods with real waiting reason and restart count
-- Fetch events, current/previous logs, YAML, owner chain (Pod → ReplicaSet → Deployment)
-- Expose REST endpoints such as `GET /api/pods` and `POST /api/investigations/context`
-
-#### Phase 3 — Failure detectors
-
-- Classify ImagePullBackOff, OOMKilled, FailedScheduling, probe Unhealthy, CreateContainerConfigError, app CrashLoop, Service selector mismatch from evidence
-
-#### Phase 4 — Documentation index
-
-- Chunk selected official Kubernetes docs
-- Embed and store in FAISS with title/section/URL metadata
-- Test retrieval per failure type
-
-#### Phase 5–6 — AI service and prompts
-
-- Endpoints: troubleshoot, summarize-logs, doc-search, check-config
-- Evidence-first prompts; structured JSON; no invented facts; recommend commands only (no auto-apply)
-
-#### Phase 7 — Integration
-
-- `POST /api/pods/{ns}/{pod}/troubleshoot`: Go builds snapshot → Python AI → validate → Postgres → response
-
-#### Phase 8 — Frontend
-
-- Dashboard, pod details, AI investigation panel, YAML checker, history
-
-#### Phase 9 — Evaluation and polish
-
-- Golden tests for all lab failures; docker-compose; demo script
 
 ---
 
 ## 8. Immediate next actions
 
-### 1. Finish Phase 1 verification
+### A. Finish Kind verification (recommended before coding)
 
 ```powershell
 kubectl config use-context kind-kubeassist-dev
 kubectl create namespace kubeassist-lab
 kubectl apply -f .\k8s\lab\
+kubectl apply -f .\k8s\rbac\
 kubectl get pods -n kubeassist-lab
 ```
 
-Inspect each failure and write golden diagnosis notes.
+Confirm each scenario against [`docs/golden/`](golden/).
 
-### 2. Start Phase 2
+### B. If implementing RAG next (without Go)
 
-- Initialize a Go module
-- Connect to Kind with client-go
-- Implement `ListPods` and print waiting reason / restart count
+1. Keep [`schemas/`](../schemas/) stable.  
+2. Follow [`docs/rag/CORPUS.md`](rag/CORPUS.md) for ingest.  
+3. Build FAISS + retrieval smoke tests using golden `searchTerms`.  
+4. Use mock `DiagnosticSnapshot` fixtures (detector pre-filled) for `/ai/troubleshoot`.  
+5. Support `LLM_MOCK=true` from [`.env.example`](../.env.example).
 
-Do **not** start React or the LLM until Go can return a solid diagnostic snapshot.
+### C. If implementing Go next (separate owner)
+
+- Two-pass collector, redaction, detectors, RBAC SA — see [ARCHITECTURE.md](ARCHITECTURE.md).  
+- Do not start React until snapshot + at least one detector work.
 
 ---
 
 ## 9. MVP definition of done
 
-The project is complete when:
-
-- [ ] Dashboard shows pods from the Kind cluster
-- [ ] Selecting a pod shows events, logs, and YAML
-- [ ] Asking why a pod is failing returns observed status, evidence, likely cause, ordered fix steps, verification commands, and doc citations
-- [ ] Documentation search and YAML config checker work
-- [ ] At least CrashLoop, ImagePull, OOM, probe failure, and missing ConfigMap are demoable
-- [ ] README explains setup and a demo path
+- [ ] Dashboard shows pods from the Kind cluster  
+- [ ] Selecting a pod shows events, logs, and YAML  
+- [ ] Troubleshoot returns all diagnosis schema fields with citations  
+- [ ] Detectors cover all 8 lab scenarios; LLM does not reclassify  
+- [ ] Secrets redacted; read-only RBAC; no auto-apply  
+- [ ] README explains setup and a demo path  
 
 ---
 
@@ -374,25 +276,10 @@ The project is complete when:
 
 | Feature | Relies on phases |
 | --- | --- |
-| Cluster dashboard | 2, 8 |
-| Pod details | 2, 8 |
-| AI troubleshooting | 2–7, 8 |
-| Doc search | 4–6, 8 |
-| Log summarization | 2, 5, 8 |
-| YAML config checker | 5–6, 8 |
-| Investigation history | 7, 8 |
-
----
-
-## 11. Target repo structure (future)
-
-```
-Kubernetes-assistant/
-├── k8s/lab/            # Done — failure manifests
-├── backend-go/         # Phase 2+
-├── ai-service/         # Phase 4–6
-├── frontend/           # Phase 8
-├── docs/               # Status + golden cases
-├── docker-compose.yml  # Phase 7/9
-└── README.md
-```
+| Cluster dashboard | 2, 6 |
+| Pod details | 2, 6 |
+| AI troubleshooting | 2–5, 6–7 |
+| Doc search / RAG | 4–5, 6 |
+| Log summarization | 2, 5, 6 |
+| Investigation history | 7, 6 |
+| Service mismatch diagnose | 2 (pass-2), 3, 5, 6 |

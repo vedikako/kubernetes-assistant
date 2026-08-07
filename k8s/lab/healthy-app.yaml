@@ -17,7 +17,7 @@ spec:
         - name: web
           image: nginx:1.27-alpine
           ports:
-            - name: http
+            - name: http 
               containerPort: 80
           resources:
             requests:

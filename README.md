@@ -1,18 +1,24 @@
 # KubeAssist AI
 
-Kubernetes troubleshooting assistant (student MVP). Collects live cluster evidence, retrieves Kubernetes docs with RAG, and returns structured diagnoses with fix steps — without auto-applying changes.
+Kubernetes troubleshooting assistant (student MVP). Collects live cluster evidence, classifies failures with **deterministic detectors**, retrieves Kubernetes docs with RAG, and returns structured diagnoses with fix steps — without auto-applying changes.
 
-**Full project status, architecture, progress, and phase roadmap:**  
-→ [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)
+| Doc | Purpose |
+| --- | --- |
+| [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) | Status + roadmap |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Locked design decisions |
+| [schemas/](schemas/) | Go ↔ AI ↔ UI contracts |
+| [docs/golden/](docs/golden/) | Expected signals per lab scenario |
+| [docs/rag/CORPUS.md](docs/rag/CORPUS.md) | Curated docs list before RAG ingest |
 
 ---
 
 ## Current progress
 
-- **Done:** Phase 1 lab manifests in [`k8s/lab/`](k8s/lab/) (8 intentional failure scenarios)
-- **Partial:** Verify every scenario on Kind
-- **Next:** Phase 2 — Go + client-go collector
-- **Overall:** ~10–15% of MVP
+- **Done:** Lab manifests (8), architecture decisions, shared schemas, golden notes, read-only RBAC, RAG corpus prep, `.env.example`
+- **Fixed:** `missing-config-app` now includes the broken Deployment (was ConfigMap-only)
+- **Partial:** Verify every scenario on Kind against goldens
+- **Next (your choice):** Kind verify, then either Go collector **or** FAISS/RAG against fixtures (schemas must stay stable)
+- **Overall:** ~20% of MVP (no app services yet)
 
 ---
 
@@ -24,6 +30,7 @@ Kubernetes troubleshooting assistant (student MVP). Collects live cluster eviden
 kind create cluster --name kubeassist-dev
 kubectl create namespace kubeassist-lab
 kubectl apply -f .\k8s\lab\
+kubectl apply -f .\k8s\rbac\
 kubectl get pods -n kubeassist-lab
 ```
 
@@ -34,20 +41,41 @@ kubectl describe pod -l app=crashloop-app -n kubeassist-lab
 kubectl logs -l app=crashloop-app -n kubeassist-lab --tail=50
 ```
 
+Service mismatch (pod is healthy — check the Service):
+
+```powershell
+kubectl get endpoints broken-service -n kubeassist-lab
+kubectl get svc broken-service -n kubeassist-lab -o yaml
+```
+
 Reset:
 
 ```powershell
 kubectl delete namespace kubeassist-lab
 kubectl create namespace kubeassist-lab
 kubectl apply -f .\k8s\lab\
+kubectl apply -f .\k8s\rbac\
 ```
+
+Compare observed signals to [docs/golden/](docs/golden/).
+
+---
+
+## Design rules (do not regress)
+
+1. Detectors (Go) set `failureType`; LLM only explains.  
+2. Collector is **two-pass** (core, then related).  
+3. Docs/FAISS index before full RAG troubleshoot.  
+4. No Redis/Kafka; Postgres for history only; SSE for pipeline stages.  
+5. Read-only RBAC; secrets never sent to the AI.
 
 ---
 
 ## What to build next
 
-1. Finish Phase 1 verification (golden notes for each failure).
-2. Start Phase 2: Go module + client-go `ListPods` (waiting reason, restart count).
-3. Do not start React or the LLM until Go can return a full diagnostic snapshot.
+1. Finish Kind verification against golden notes.  
+2. **RAG track:** ingest curated corpus → FAISS → retrieval tests (use schemas + golden `searchTerms`; mock snapshots OK).  
+3. **Go track (other owner):** client-go snapshot + detectors; integrate later via schemas.  
+4. Do not change [schemas/](schemas/) without agreeing across owners.
 
-See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for the complete roadmap.
+See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for the full roadmap.
