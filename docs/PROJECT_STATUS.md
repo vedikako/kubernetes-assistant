@@ -3,6 +3,8 @@
 Detailed overview of what the project is, how much is done, what comes next, and how the system fits together.
 
 **Architecture decisions (weak spots fixed):** → [ARCHITECTURE.md](ARCHITECTURE.md)  
+**Why we chose X:** → [decision.md](decision.md)  
+**Progress log:** → [projectprogress.md](projectprogress.md)  
 **Shared contracts:** → [`schemas/`](../schemas/)  
 **Golden notes:** → [`docs/golden/`](golden/)  
 **RAG corpus prep:** → [`docs/rag/CORPUS.md`](rag/CORPUS.md)

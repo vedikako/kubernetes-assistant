@@ -22,11 +22,11 @@
   "properties": {
     "schemaVersion": {
       "type": "string",
-      "const": "1.0.0"
+      "const": "1.1.0"
     },
     "failureType": {
       "type": "string",
-      "description": "Must echo detector.failureType from the snapshot (do not reclassify)",
+      "description": "Must echo detector.failureType from the snapshot (do not reclassify). ErrImagePull is not a type; echo ImagePullBackOff.",
       "enum": [
         "Healthy",
         "CrashLoopBackOff",
@@ -36,6 +36,10 @@
         "CreateContainerConfigError",
         "FailedScheduling",
         "ServiceSelectorMismatch",
+        "Evicted",
+        "InitContainerFailure",
+        "VolumeMountFailure",
+        "ReadinessFailure",
         "Unknown"
       ]
     },

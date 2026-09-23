@@ -4,21 +4,24 @@ Kubernetes troubleshooting assistant (student MVP). Collects live cluster eviden
 
 | Doc | Purpose |
 | --- | --- |
+| [docs/projectprogress.md](docs/projectprogress.md) | Running progress log |
+| [docs/decision.md](docs/decision.md) | Why we chose each design |
 | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) | Status + roadmap |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Locked design decisions |
 | [schemas/](schemas/) | Go ↔ AI ↔ UI contracts |
 | [docs/golden/](docs/golden/) | Expected signals per lab scenario |
 | [docs/rag/CORPUS.md](docs/rag/CORPUS.md) | Curated docs list before RAG ingest |
+| [ai-service/README.md](ai-service/README.md) | Run the Python RAG service |
 
 ---
 
 ## Current progress
 
-- **Done:** Lab manifests (8), architecture decisions, shared schemas, golden notes, read-only RBAC, RAG corpus prep, `.env.example`
+- **Done:** Lab manifests (8), architecture decisions, shared schemas 1.1.0, golden notes, read-only RBAC, RAG corpus prep, `.env.example`
+- **RAG:** `ai-service/` FastAPI `/ai/troubleshoot` with local hashed index, mock-LLM diagnoses, schema-valid Go POST fixtures
 - **Fixed:** `missing-config-app` now includes the broken Deployment (was ConfigMap-only)
-- **Partial:** Verify every scenario on Kind against goldens
-- **Next (your choice):** Kind verify, then either Go collector **or** FAISS/RAG against fixtures (schemas must stay stable)
-- **Overall:** ~20% of MVP (no app services yet)
+- **Partial:** Verify every scenario on Kind against goldens; live OpenAI embeddings/LLM optional
+- **Overall:** RAG MVP runnable against fixtures; Go API still separate
 
 ---
 
